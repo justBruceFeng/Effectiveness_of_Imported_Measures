@@ -566,7 +566,7 @@ def prepare_reliability_data(data, import_date_str, analysis_years=3):
     return filtered_data
 
 class AdvancedReliabilityAnalyzer:
-    """高级可靠性分析器 - 修复版本"""
+    """高级可靠性分析器 - 简化版，只输出标准概率图"""
     
     def __init__(self, analysis_years=3, interval_months=6):
         self.analysis_years = analysis_years
@@ -728,13 +728,17 @@ class AdvancedReliabilityAnalyzer:
         if fit_result is None:
             return None
         
-        distribution, best_model_name, ad_value, ad_corrected, bic_value = fit_result
+        distribution, best_model_name, ad_value, ad_corrected, bic_value, fit_result_obj = fit_result
         
         # 计算累计失效率
-        cumulative_failure = self._calculate_cumulative_failure_safe(distribution)
+        cumulative_failure = self._calculate_cumulative_failure_robust(distribution, best_model_name)
         
         # 计算失效率函数
-        failure_rate = self._calculate_failure_rate_safe(distribution)
+        failure_rate = self._calculate_failure_rate_robust(distribution, best_model_name)
+        
+        # 输出模型参数用于调试
+        if best_model_name == 'Weibull_Mixture_2Comp':
+            self._print_mixture_model_params(distribution)
         
         # 存储结果
         result = {
@@ -747,11 +751,115 @@ class AdvancedReliabilityAnalyzer:
             'BIC': bic_value,
             'cumulative_failure': cumulative_failure,
             'failure_rate': failure_rate,
-            'distribution': distribution
+            'distribution': distribution,
+            'fit_result': fit_result_obj,
+            'durations': durations,
+            'events': events
         }
         
         self.analysis_results['完整数据分析'] = result
         return result
+
+    def _print_mixture_model_params(self, mixture_dist):
+        """打印混合模型参数"""
+        print("\n混合模型参数:")
+        try:
+            if hasattr(mixture_dist, 'distributions') and hasattr(mixture_dist, 'proportions'):
+                for i, (dist, prop) in enumerate(zip(mixture_dist.distributions, mixture_dist.proportions)):
+                    print(f"  组分{i+1} (比例={prop:.4f}):")
+                    if hasattr(dist, 'alpha') and hasattr(dist, 'beta'):
+                        print(f"    α={dist.alpha:.2f}, β={dist.beta:.2f}")
+                    
+                    # 计算该组分的特征寿命
+                    if hasattr(dist, 'alpha'):
+                        characteristic_life = dist.alpha
+                        mean_life = dist.mean
+                        print(f"    特征寿命={characteristic_life:.2f}天, 平均寿命={mean_life:.2f}天")
+                    
+                    # 计算该组分在不同时间点的累计失效率
+                    print("    累计失效率预测:")
+                    for months in [3, 6, 12, 24]:
+                        days = int(months * 30.44)
+                        try:
+                            cdf = dist.CDF(days)
+                            print(f"      {months}个月: {cdf*100:.4f}%")
+                        except:
+                            print(f"      {months}个月: 计算失败")
+        except Exception as e:
+            print(f"输出混合模型参数失败: {e}")
+
+    def _calculate_cumulative_failure_robust(self, distribution, model_name):
+        """鲁棒地计算累计失效率"""
+        try:
+            if distribution is None:
+                return {}
+            
+            cumulative_failure = {}
+            
+            for days in self.key_time_points:
+                try:
+                    # 对于混合模型，需要特殊处理
+                    if model_name == 'Weibull_Mixture_2Comp':
+                        # 混合模型的CDF计算
+                        cdf = distribution.CDF(days)
+                    else:
+                        # 其他模型的CDF计算
+                        cdf = distribution.CDF(days)
+                    
+                    # 确保CDF在0-1范围内
+                    cdf = max(0.0, min(1.0, cdf))
+                    cumulative_failure[days] = cdf
+                    
+                except Exception as e:
+                    print(f"计算{days}天累计失效率失败: {e}")
+                    cumulative_failure[days] = None
+            
+            return cumulative_failure
+        except Exception as e:
+            print(f"计算累计失效率失败: {e}")
+            return {}
+
+    def _calculate_failure_rate_robust(self, distribution, model_name):
+        """鲁棒地计算失效率函数"""
+        try:
+            if distribution is None:
+                return {}
+            
+            failure_rate = {}
+            
+            for days in self.key_time_points:
+                try:
+                    # 尝试使用PDF和SF计算
+                    if hasattr(distribution, 'PDF') and hasattr(distribution, 'SF'):
+                        pdf = distribution.PDF(days)
+                        sf = distribution.SF(days)
+                        if sf > 1e-10:  # 避免除以极小的数
+                            failure_rate[days] = pdf / sf
+                        else:
+                            failure_rate[days] = 0.0
+                    else:
+                        # 备选计算方法：数值微分
+                        epsilon = 1e-5
+                        cdf_plus = distribution.CDF(days + epsilon)
+                        cdf_minus = distribution.CDF(days - epsilon)
+                        failure_rate[days] = (cdf_plus - cdf_minus) / (2 * epsilon)
+                    
+                except Exception as e:
+                    # 尝试备选计算方法
+                    try:
+                        # 使用数值微分近似计算失效率
+                        h = 0.1
+                        cdf_t = distribution.CDF(days)
+                        cdf_tplus = distribution.CDF(days + h)
+                        hazard_rate = (cdf_tplus - cdf_t) / (h * (1 - cdf_t + 1e-10))
+                        failure_rate[days] = hazard_rate
+                    except:
+                        failure_rate[days] = None
+            
+            return failure_rate
+        except Exception as e:
+            print(f"计算失效率失败: {e}")
+            return {}
 
     def _fit_comprehensive_distributions(self, durations, events):
         """拟合完整分布模型 - 更新AD值计算和模型选择逻辑"""
@@ -884,7 +992,7 @@ class AdvancedReliabilityAnalyzer:
             marker = "★" if result[0] == dist_name else " "
             print(f"{marker} {result[0]:<23} {result[1]:>8.4f} {result[2]:>10.4f} {result[3]:>10.2f} {'最佳' if result[0] == dist_name else ''}")
         
-        return distribution_obj, dist_name, ad_value, ad_corrected, bic_value
+        return distribution_obj, dist_name, ad_value, ad_corrected, bic_value, fit_result
 
     def _select_best_model_by_new_criteria(self, all_results):
         """根据新规则选择最佳模型：先判断AD修正值，差异5%以内再判断BIC"""
@@ -1004,58 +1112,123 @@ class AdvancedReliabilityAnalyzer:
             print(f"计算BIC失败: {e}")
             return 10000
 
-    def _calculate_cumulative_failure_safe(self, distribution):
-        """安全计算累计失效率"""
-        try:
-            if distribution is None:
-                return {}
+    def plot_standard_probability_plots(self, comparison_results, output_dir="output"):
+        """绘制标准概率图 - 使用reliability库的Fitters现有方法"""
+        if not comparison_results:
+            print("没有对比结果可绘制")
+            return
+        
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for group_name, result in comparison_results.items():
+            print(f"\n绘制{group_name}的标准概率图...")
             
-            cumulative_failure = {}
-            for days in self.key_time_points:
-                try:
-                    # 累计失效率 = 1 - 可靠度
-                    reliability = distribution.SF(days)
-                    # 避免数值下溢
-                    if reliability >= 1 - 1e-10:
-                        cumulative_failure[days] = 0.0
-                    else:
-                        cumulative_failure[days] = 1 - reliability
-                except Exception as e:
-                    print(f"计算{days}天累计失效率失败: {e}")
-                    cumulative_failure[days] = None
+            durations = result.get('durations')
+            events = result.get('events')
             
-            return cumulative_failure
-        except Exception as e:
-            print(f"计算累计失效率失败: {e}")
-            return {}
-
-    def _calculate_failure_rate_safe(self, distribution):
-        """安全计算失效率函数"""
-        try:
-            if distribution is None:
-                return {}
+            if durations is None or events is None:
+                print(f"警告: {group_name}缺少持续时间或事件数据")
+                continue
             
-            failure_rate = {}
-            for days in self.key_time_points:
-                try:
-                    # 失效率 = PDF / SF
-                    pdf = distribution.PDF(days)
-                    sf = distribution.SF(days)
-                    if sf > 1e-10:  # 避免除以极小的数
-                        failure_rate[days] = pdf / sf
-                    else:
-                        failure_rate[days] = 0.0
-                except Exception as e:
-                    print(f"计算{days}天失效率失败: {e}")
-                    failure_rate[days] = None
+            # 准备失效时间和截尾时间
+            failure_times = durations[events == 1].values
+            right_censored = durations[events == 0].values
             
-            return failure_rate
-        except Exception as e:
-            print(f"计算失效率失败: {e}")
-            return {}
-
-    def plot_comparison_charts(self, comparison_results, output_dir="output"):
-        """绘制改善前后对比图表"""
+            if len(failure_times) < 2:
+                print(f"警告: {group_name}失效数据不足，无法绘制概率图")
+                continue
+            
+            # 获取最佳模型
+            best_model = result.get('best_model', 'Weibull_2P')
+            
+            # 根据最佳模型类型选择合适的Fitter
+            try:
+                fit_result = None
+                
+                if best_model in ['Weibull_2P', 'Weibull_3P', 'Weibull_Mixture_2Comp']:
+                    # 使用Weibull拟合
+                    fit_result = Fit_Weibull_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,  # 显示概率图
+                        print_results=True
+                    )
+                    
+                elif best_model == 'Lognormal_2P':
+                    fit_result = Fit_Lognormal_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                    
+                elif best_model == 'Normal_2P':
+                    fit_result = Fit_Normal_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                    
+                elif best_model == 'Gamma_2P':
+                    fit_result = Fit_Gamma_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                    
+                elif best_model == 'Loglogistic_2P':
+                    fit_result = Fit_Loglogistic_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                    
+                elif best_model == 'Gumbel_2P':
+                    fit_result = Fit_Gumbel_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                    
+                elif best_model == 'Exponential_2P':
+                    fit_result = Fit_Exponential_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                else:
+                    print(f"警告: 未知模型类型 {best_model}，使用Weibull分布")
+                    fit_result = Fit_Weibull_2P(
+                        failures=failure_times,
+                        right_censored=right_censored if len(right_censored) > 0 else None,
+                        show_probability_plot=True,
+                        print_results=True
+                    )
+                
+                # 获取当前图形并保存
+                plt.figure(plt.gcf().number)  # 获取当前图形
+                plt.title(f'{group_name} - {best_model}概率图', fontsize=14, fontweight='bold')
+                plt.tight_layout()
+                
+                # 保存图表
+                plot_path = os.path.join(output_dir, f'{group_name}_标准概率图.png')
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                plt.show()
+                print(f"{group_name}标准概率图已保存: {plot_path}")
+                
+            except Exception as e:
+                print(f"绘制{group_name}标准概率图失败: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def plot_comparison_charts_only(self, comparison_results, output_dir="output"):
+        """只绘制改善前后对比图表"""
         if not comparison_results:
             print("没有对比结果可绘制")
             return
@@ -1413,9 +1586,16 @@ def main():
         # 输出综合结果报告
         analyzer.print_comprehensive_comparison(comparison_results)
         
+        # 绘制标准概率图
+        print("\n生成标准概率图...")
+        analyzer.plot_standard_probability_plots(
+            comparison_results, 
+            output_dir=user_config['output_dir']
+        )
+        
         # 绘制对比图表
         print("\n生成对比图表...")
-        analyzer.plot_comparison_charts(
+        analyzer.plot_comparison_charts_only(
             comparison_results, 
             output_dir=user_config['output_dir']
         )
